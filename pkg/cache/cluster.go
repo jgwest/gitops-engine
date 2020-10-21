@@ -127,7 +127,9 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 			Log:    log,
 			Tracer: tracing.NopTracer{},
 		},
-		syncTime:                nil,
+		syncStatus: &clusterCacheSync{
+			syncTime: nil,
+		},
 		resourceUpdatedHandlers: map[uint64]OnResourceUpdatedHandler{},
 		eventHandlers:           map[uint64]OnEventHandler{},
 		log:                     log,
@@ -140,8 +142,9 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 
 type clusterCache struct {
 	resyncTimeout time.Duration
-	syncTime      *time.Time
-	syncError     error
+
+	syncStatus *clusterCacheSync
+
 	apisMeta      map[schema.GroupKind]*apiMeta
 	serverVersion string
 	apiGroups     []metav1.APIGroup
@@ -170,6 +173,16 @@ type clusterCache struct {
 	populateResourceInfoHandler OnPopulateResourceInfoHandler
 	resourceUpdatedHandlers     map[uint64]OnResourceUpdatedHandler
 	eventHandlers               map[uint64]OnEventHandler
+}
+
+type clusterCacheSync struct {
+	// When using this struct:
+	// 1) 'lock' mutex should be acquired when reading/writing from fields of this struct.
+	// 2) The parent 'clusterCache.lock' does NOT need to be owned to r/w from fields of this struct (if it is owned, that is fine, but see below)
+	// 3) To prevent deadlocks, do not acquire parent 'clusterCache.lock' after acquiring this lock; if you need both locks, always acquire the parent lock first
+	lock      sync.Mutex
+	syncTime  *time.Time
+	syncError error
 }
 
 // OnResourceUpdated register event handler that is executed every time when resource get's updated in the cache
@@ -312,7 +325,11 @@ func (c *clusterCache) setNode(n *Resource) {
 func (c *clusterCache) Invalidate(opts ...UpdateSettingsFunc) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	c.syncTime = nil
+
+	c.syncStatus.lock.Lock()
+	c.syncStatus.syncTime = nil
+	c.syncStatus.lock.Unlock()
+
 	for i := range c.apisMeta {
 		c.apisMeta[i].watchCancel()
 	}
@@ -325,11 +342,13 @@ func (c *clusterCache) Invalidate(opts ...UpdateSettingsFunc) {
 }
 
 func (c *clusterCache) synced() bool {
-	syncTime := c.syncTime
+	syncStatus := c.syncStatus
+	syncTime := syncStatus.syncTime
+
 	if syncTime == nil {
 		return false
 	}
-	if c.syncError != nil {
+	if syncStatus.syncError != nil {
 		return time.Now().Before(syncTime.Add(ClusterRetryTimeout))
 	}
 	return time.Now().Before(syncTime.Add(c.resyncTimeout))
@@ -601,23 +620,32 @@ func (c *clusterCache) sync() error {
 
 // EnsureSynced checks cache state and synchronizes it if necessary
 func (c *clusterCache) EnsureSynced() error {
-	// first check if cluster is synced *without lock*
+	syncStatus := c.syncStatus
+
+	// first check if cluster is synced *without acquiring the full clusterCache lock*
+	syncStatus.lock.Lock()
 	if c.synced() {
-		return c.syncError
+		syncError := syncStatus.syncError
+		syncStatus.lock.Unlock()
+		return syncError
 	}
+	syncStatus.lock.Unlock() // release the lock, so that we can acquire the parent lock (see struct comment re: lock acquisition ordering)
 
 	c.lock.Lock()
+	syncStatus.lock.Lock()
 	defer c.lock.Unlock()
+	defer syncStatus.lock.Unlock()
+
 	// before doing any work, check once again now that we have the lock, to see if it got
 	// synced between the first check and now
 	if c.synced() {
-		return c.syncError
+		return syncStatus.syncError
 	}
 	err := c.sync()
 	syncTime := time.Now()
-	c.syncTime = &syncTime
-	c.syncError = err
-	return c.syncError
+	syncStatus.syncTime = &syncTime
+	syncStatus.syncError = err
+	return syncStatus.syncError
 }
 
 // GetNamespaceTopLevelResources returns top level resources in the specified namespace
@@ -841,14 +869,16 @@ var (
 // GetClusterInfo returns cluster cache statistics
 func (c *clusterCache) GetClusterInfo() ClusterInfo {
 	c.lock.RLock()
+	c.syncStatus.lock.Lock()
 	defer c.lock.RUnlock()
+	defer c.syncStatus.lock.Unlock()
 	return ClusterInfo{
 		APIsCount:         len(c.apisMeta),
 		K8SVersion:        c.serverVersion,
 		ResourcesCount:    len(c.resources),
 		Server:            c.config.Host,
-		LastCacheSyncTime: c.syncTime,
-		SyncError:         c.syncError,
+		LastCacheSyncTime: c.syncStatus.syncTime,
+		SyncError:         c.syncStatus.syncError,
 	}
 }
 
