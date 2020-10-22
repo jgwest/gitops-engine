@@ -114,7 +114,6 @@ type WeightedSemaphore interface {
 func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCache {
 	log := klogr.New()
 	cache := &clusterCache{
-		resyncTimeout:      clusterResyncTimeout,
 		settings:           Settings{ResourceHealthOverride: &noopSettings{}, ResourcesFilter: &noopSettings{}},
 		apisMeta:           make(map[schema.GroupKind]*apiMeta),
 		listPageSize:       defaultListPageSize,
@@ -127,8 +126,9 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 			Log:    log,
 			Tracer: tracing.NopTracer{},
 		},
-		syncStatus: &clusterCacheSync{
-			syncTime: nil,
+		syncStatus: clusterCacheSync{
+			resyncTimeout: clusterResyncTimeout,
+			syncTime:      nil,
 		},
 		resourceUpdatedHandlers: map[uint64]OnResourceUpdatedHandler{},
 		eventHandlers:           map[uint64]OnEventHandler{},
@@ -141,9 +141,7 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 }
 
 type clusterCache struct {
-	resyncTimeout time.Duration
-
-	syncStatus *clusterCacheSync
+	syncStatus clusterCacheSync
 
 	apisMeta      map[schema.GroupKind]*apiMeta
 	serverVersion string
@@ -180,9 +178,10 @@ type clusterCacheSync struct {
 	// 1) 'lock' mutex should be acquired when reading/writing from fields of this struct.
 	// 2) The parent 'clusterCache.lock' does NOT need to be owned to r/w from fields of this struct (if it is owned, that is fine, but see below)
 	// 3) To prevent deadlocks, do not acquire parent 'clusterCache.lock' after acquiring this lock; if you need both locks, always acquire the parent lock first
-	lock      sync.Mutex
-	syncTime  *time.Time
-	syncError error
+	lock          sync.Mutex
+	syncTime      *time.Time
+	syncError     error
+	resyncTimeout time.Duration
 }
 
 // OnResourceUpdated register event handler that is executed every time when resource get's updated in the cache
@@ -341,8 +340,8 @@ func (c *clusterCache) Invalidate(opts ...UpdateSettingsFunc) {
 	c.log.Info("Invalidated cluster")
 }
 
-func (c *clusterCache) synced() bool {
-	syncStatus := c.syncStatus
+// clusterCacheSync's lock should be held before calling this method
+func (syncStatus *clusterCacheSync) synced() bool {
 	syncTime := syncStatus.syncTime
 
 	if syncTime == nil {
@@ -351,7 +350,7 @@ func (c *clusterCache) synced() bool {
 	if syncStatus.syncError != nil {
 		return time.Now().Before(syncTime.Add(ClusterRetryTimeout))
 	}
-	return time.Now().Before(syncTime.Add(c.resyncTimeout))
+	return time.Now().Before(syncTime.Add(syncStatus.resyncTimeout))
 }
 
 func (c *clusterCache) stopWatching(gk schema.GroupKind, ns string) {
@@ -620,11 +619,11 @@ func (c *clusterCache) sync() error {
 
 // EnsureSynced checks cache state and synchronizes it if necessary
 func (c *clusterCache) EnsureSynced() error {
-	syncStatus := c.syncStatus
+	syncStatus := &c.syncStatus
 
 	// first check if cluster is synced *without acquiring the full clusterCache lock*
 	syncStatus.lock.Lock()
-	if c.synced() {
+	if syncStatus.synced() {
 		syncError := syncStatus.syncError
 		syncStatus.lock.Unlock()
 		return syncError
@@ -632,13 +631,13 @@ func (c *clusterCache) EnsureSynced() error {
 	syncStatus.lock.Unlock() // release the lock, so that we can acquire the parent lock (see struct comment re: lock acquisition ordering)
 
 	c.lock.Lock()
-	syncStatus.lock.Lock()
 	defer c.lock.Unlock()
+	syncStatus.lock.Lock()
 	defer syncStatus.lock.Unlock()
 
 	// before doing any work, check once again now that we have the lock, to see if it got
 	// synced between the first check and now
-	if c.synced() {
+	if syncStatus.synced() {
 		return syncStatus.syncError
 	}
 	err := c.sync()
@@ -869,9 +868,10 @@ var (
 // GetClusterInfo returns cluster cache statistics
 func (c *clusterCache) GetClusterInfo() ClusterInfo {
 	c.lock.RLock()
-	c.syncStatus.lock.Lock()
 	defer c.lock.RUnlock()
+	c.syncStatus.lock.Lock()
 	defer c.syncStatus.lock.Unlock()
+
 	return ClusterInfo{
 		APIsCount:         len(c.apisMeta),
 		K8SVersion:        c.serverVersion,
