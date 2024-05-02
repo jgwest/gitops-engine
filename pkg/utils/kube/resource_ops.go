@@ -124,6 +124,82 @@ func (k *kubectlResourceOperations) runResourceCommand(ctx context.Context, obj 
 	return strings.Join(out, ". "), nil
 }
 
+// func (k *kubectlResourceOperations) runResourceCommand(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, serverSideDiff bool, executor commandExecutor) (string, error) {
+// 	manifestBytes, err := json.Marshal(obj)
+// 	if err != nil {
+// 		return "", err
+// 	}
+// 	manifestFile, err := os.CreateTemp(io.TempDir, "")
+// 	if err != nil {
+// 		return "", fmt.Errorf("Failed to generate temp file for manifest: %v", err)
+// 	}
+
+// 	if _, err = manifestFile.Write(manifestBytes); err != nil {
+// 		return "", fmt.Errorf("Failed to write manifest: %v", err)
+// 	}
+// 	if err = manifestFile.Close(); err != nil {
+// 		return "", fmt.Errorf("Failed to close manifest: %v", err)
+// 	}
+
+// 	// log manifest
+// 	if k.log.V(1).Enabled() {
+// 		var obj unstructured.Unstructured
+// 		err := json.Unmarshal(manifestBytes, &obj)
+// 		if err != nil {
+// 			return "", err
+// 		}
+// 		redacted, _, err := diff.HideSecretData(&obj, nil)
+// 		if err != nil {
+// 			return "", err
+// 		}
+// 		redactedBytes, err := json.Marshal(redacted)
+// 		if err != nil {
+// 			return "", err
+// 		}
+// 		k.log.V(1).Info(string(redactedBytes))
+// 	}
+
+// 	var out []string
+// 	// rbac resouces are first applied with auth reconcile kubectl feature.
+// 	// serverSideDiff should avoid this step as the resources are not being actually
+// 	// applied but just running in dryrun mode. Also, kubectl auth reconcile doesn't
+// 	// currently support running dryrun in server mode.
+// 	if obj.GetAPIVersion() == "rbac.authorization.k8s.io/v1" && !serverSideDiff {
+// 		outReconcile, err := k.rbacReconcile(ctx, obj, manifestFile.Name(), dryRunStrategy)
+// 		if err != nil {
+// 			return "", fmt.Errorf("error running rbacReconcile: %s", err)
+// 		}
+// 		out = append(out, outReconcile)
+// 		// We still want to fallthrough and run `kubectl apply` in order set the
+// 		// last-applied-configuration annotation in the object.
+// 	}
+
+// 	io.DeleteFile(manifestFile.Name())
+
+// 	stdin := &bytes.Buffer{}
+// 	if _, err := stdin.Write(manifestBytes); err != nil {
+// 		return "", err
+// 	}
+
+// 	// Run kubectl apply
+// 	ioStreams := genericclioptions.IOStreams{
+// 		In:     stdin,
+// 		Out:    &bytes.Buffer{},
+// 		ErrOut: &bytes.Buffer{},
+// 	}
+// 	err = executor(k.fact, ioStreams, "-")
+// 	if err != nil {
+// 		return "", errors.New(cleanKubectlOutput(err.Error()))
+// 	}
+// 	if buf := strings.TrimSpace(ioStreams.Out.(*bytes.Buffer).String()); len(buf) > 0 {
+// 		out = append(out, buf)
+// 	}
+// 	if buf := strings.TrimSpace(ioStreams.ErrOut.(*bytes.Buffer).String()); len(buf) > 0 {
+// 		out = append(out, buf)
+// 	}
+// 	return strings.Join(out, ". "), nil
+// }
+
 // rbacReconcile will perform reconciliation for RBAC resources. It will run
 // the following command:
 //
@@ -175,6 +251,14 @@ func (k *kubectlResourceOperations) ReplaceResource(ctx context.Context, obj *un
 		if err != nil {
 			return err
 		}
+
+		fmt.Println("JGW replace:", replaceOptions.DeleteOptions.Timeout)
+
+		if replaceOptions.DeleteOptions.Timeout == 0 {
+			replaceOptions.DeleteOptions.Timeout = defaultKubectlRequestTimeout
+			fmt.Println("JGW replace: modified to default")
+		}
+
 		return replaceOptions.Run(f)
 	})
 }
@@ -261,6 +345,14 @@ func (k *kubectlResourceOperations) ApplyResource(ctx context.Context, obj *unst
 		if err != nil {
 			return err
 		}
+
+		fmt.Println("JGW apply:", applyOpts.DeleteOptions.Timeout)
+
+		if applyOpts.DeleteOptions.Timeout == 0 {
+			applyOpts.DeleteOptions.Timeout = defaultKubectlRequestTimeout
+			fmt.Println("JGW apply: modified to default")
+		}
+
 		return applyOpts.Run()
 	})
 }
@@ -352,11 +444,14 @@ func (k *kubectlResourceOperations) newCreateOptions(config *rest.Config, ioStre
 	}
 	o.Recorder = recorder
 
+	// o.ValidationDirective = metav1.FieldValidationIgnore
+
 	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
 		return nil, err
 	}
 
+	// o.ValidationDirective =
 	o.DryRunVerifier = resource.NewQueryParamVerifier(dynamicClient, k.fact.OpenAPIGetter(), resource.QueryParamDryRun)
 	o.FieldValidationVerifier = resource.NewQueryParamVerifier(dynamicClient, k.fact.OpenAPIGetter(), resource.QueryParamFieldValidation)
 

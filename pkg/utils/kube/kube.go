@@ -55,6 +55,10 @@ const (
 	HorizontalPodAutoscalerKind  = "HorizontalPodAutoscaler"
 )
 
+const (
+	defaultKubectlRequestTimeout = time.Hour * 6
+)
+
 type ResourceInfoProvider interface {
 	IsNamespaced(gk schema.GroupKind) (bool, error)
 }
