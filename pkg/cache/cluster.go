@@ -429,8 +429,10 @@ func (c *clusterCache) Invalidate(opts ...UpdateSettingsFunc) {
 	c.syncStatus.syncTime = nil
 	c.syncStatus.lock.Unlock()
 
+	debug.PrintStack()
+
 	for i := range c.apisMeta {
-		c.apisMeta[i].watchCancel()
+		c.apisMeta[i].watchCancel() // jgw0
 	}
 	for i := range opts {
 		opts[i](c)
@@ -461,7 +463,7 @@ func (c *clusterCache) stopWatching(gk schema.GroupKind, ns string) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	if info, ok := c.apisMeta[gk]; ok {
-		info.watchCancel()
+		info.watchCancel() // jgw0
 		delete(c.apisMeta, gk)
 		c.replaceResourceCache(gk, nil, ns)
 		c.log.Info(fmt.Sprintf("Stop watching: %s not found", gk))
@@ -801,7 +803,7 @@ func (c *clusterCache) sync() error {
 	c.log.Info("Start syncing cluster")
 
 	for i := range c.apisMeta {
-		c.apisMeta[i].watchCancel()
+		c.apisMeta[i].watchCancel() // jgw0
 	}
 	c.apisMeta = make(map[schema.GroupKind]*apiMeta)
 	c.resources = make(map[kube.ResourceKey]*Resource)
